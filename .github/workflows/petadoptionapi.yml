@@ -1,0 +1,132 @@
+name: Build and deploy .NET Core application
+on:
+  push:
+    branches:
+      - master
+
+env:
+  AZURE_WEBAPP_NAME: petadoptionapi
+  AZURE_WEBAPP_PACKAGE_PATH: './publish'
+  AZURE_APIM_RESOURCE_PATH: /
+  AZURE_APIM_RESOURCEGROUP: petadoptionapi_group
+  AZURE_APIM_SERVICENAME: PetAdoptionAppPrn231Group9api
+  AZURE_APIM_API_ID: PetAdoptionAppPrn231Group9
+  AZURE_APIM_APPSERVICEURL: 'https://petadoptionapi.azurewebsites.net'
+  SWASHBUCKLE_ASPNET_CORE_CLI_PACKAGE_VERSION: 6.5.0
+  CONFIGURATION: Release
+  DOTNET_CORE_VERSION: 7.0.x
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v1.8.0
+        with:
+          include-prerelease: True
+          dotnet-version: ${{ env.DOTNET_CORE_VERSION }}
+      
+      - name: Debug - Display directory structure before build
+        shell: pwsh
+        run: |
+          Write-Host "Current directory:"
+          pwd
+          Write-Host "nDirectory contents:"
+          Get-ChildItem -Recurse -Filter "*.csproj" | ForEach-Object {
+              Write-Host "nFound project file: $($_.FullName)"
+              $content = Get-Content $_.FullName
+              Write-Host "Project file contents:"
+              $content
+          }
+      
+      - name: Find Web API project file
+        shell: pwsh
+        run: |
+          $projectFile = Get-ChildItem -Recurse -Filter "*.csproj" | 
+            Where-Object { $_.FullName -notlike "*BusinessLogicLayer*" -and $_.FullName -notlike "*DataAccessLayer*" } | 
+            Select-Object -First 1
+          
+          if ($projectFile) {
+              Write-Host "Found Web API project file: $($projectFile.FullName)"
+              echo "BUILD_PATH=$($projectFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              $projectDir = $projectFile.Directory.FullName
+              echo "PROJECT_DIR=$projectDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+              
+              # Get assembly name from project file
+              $projectContent = [xml](Get-Content $projectFile.FullName)
+              $assemblyName = $projectContent.Project.PropertyGroup.AssemblyName
+              if ($assemblyName) {
+                  Write-Host "Found assembly name: $assemblyName"
+                  echo "ASSEMBLY_NAME=$assemblyName" | Out-File -FilePath $env:GITHUB_ENV -Append
+              } else {
+                  $assemblyName = $projectFile.BaseName
+                  Write-Host "Using project name as assembly name: $assemblyName"
+                  echo "ASSEMBLY_NAME=$assemblyName" | Out-File -FilePath $env:GITHUB_ENV -Append
+              }
+          } else {
+              Write-Error "No Web API project file found!"
+              exit 1
+          }
+      
+      - name: Run dotnet restore
+        run: dotnet restore "${{ env.BUILD_PATH }}"
+      
+      - name: Build
+        run: dotnet build "${{ env.BUILD_PATH }}" --configuration ${{ env.CONFIGURATION }} --no-restore
+      
+      - name: Publish
+        run: dotnet publish "${{ env.BUILD_PATH }}" --configuration ${{ env.CONFIGURATION }} --no-build --output "${{ env.AZURE_WEBAPP_PACKAGE_PATH }}"
+      
+      - name: Debug - Display publish directory contents
+        shell: pwsh
+        run: |
+          Write-Host "Published files in ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}:"
+          Get-ChildItem -Path "${{ env.AZURE_WEBAPP_PACKAGE_PATH }}" -Recurse | Select-Object FullName
+      
+      - name: Install Swashbuckle CLI .NET Tool
+        run: |
+          dotnet new tool-manifest --force
+          dotnet tool install Swashbuckle.AspNetCore.Cli --version ${{ env.SWASHBUCKLE_ASPNET_CORE_CLI_PACKAGE_VERSION }}
+      
+      - name: Publish Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: webapp
+          path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+
+  deploy:
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - name: Azure Login
+        uses: azure/login@hf_447_release 
+        with:
+            creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+            enable-AzPSSession: false
+            environment: azurecloud
+            allow-no-subscriptions: false
+            audience: api://AzureADTokenExchange
+            auth-type: SERVICE_PRINCIPAL
+            subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v3
+        with:
+          name: webapp
+          path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+      
+      - name: Deploy to Azure WebApp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+          publish-profile: ${{ secrets.petadoptionapi_E629 }}
+      
+      - name: Import API into Azure API Management
+        run: az apim api import --path "${{ env.AZURE_APIM_RESOURCE_PATH }}" --resource-group "${{ env.AZURE_APIM_RESOURCEGROUP }}" --service-name "${{ env.AZURE_APIM_SERVICENAME }}" --api-id "${{ env.AZURE_APIM_API_ID }}" --service-url "${{ env.AZURE_APIM_APPSERVICEURL }}" --specification-path "${{ env.AZURE_WEBAPP_PACKAGE_PATH }}/swagger.json" --specification-format OpenApi --subscription-required false
+      
+      - name: Logout from Azure
+        run: az logout

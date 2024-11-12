@@ -1,0 +1,2 @@
+﻿
+dotnet ef database update --project DataAccessObjects --startup-project PetAdoptionApp_Prn231_Group9
